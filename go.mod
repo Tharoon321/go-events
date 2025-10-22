@@ -1,6 +1,6 @@
 module github.com/Tharoon321/go-events
 
-go 1.25.3
+go 1.25
 
 require (
 	github.com/gin-gonic/gin v1.11.0
