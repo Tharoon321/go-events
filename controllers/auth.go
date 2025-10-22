@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 	"fmt"
+	"go.mongodb.org/mongo-driver/mongo"  
 
 	"github.com/gin-gonic/gin"
 	"github.com/Tharoon321/go-events/config"
@@ -23,8 +24,8 @@ import (
 type RegisterInput struct {
 	Name     string `json:"name" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=6"`
-	Role     string `json:"role" binding:"required,oneof=creator attendee"`
+	Password string `json:"password" binding:"required"`
+	Role     string `json:"role" binding:"required"` // "creator" or "attendee"
 }
 
 // LoginInput request body for login
@@ -53,43 +54,46 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	// create short-lived ctx for DB operations
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	users := config.DB.Collection("users")
+	usersCol := config.DB.Collection("users")
 
-	// Check if email exists
-	count, err := users.CountDocuments(ctx, bson.M{"email": input.Email})
-	if err != nil {
+	// check if user already exists
+	var existing models.User
+	err := usersCol.FindOne(ctx, bson.M{"email": input.Email}).Decode(&existing)
+	if err == nil {
+		// user found -> duplicate
+		c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
+		return
+	}
+	if err != nil && err != mongo.ErrNoDocuments {
+		// unexpected DB error
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
-	if count > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "email already registered"})
+
+	// hash the password before saving
+	hash, err := utils.HashPassword(input.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
 
-	// Hash password
-	hashed, err := utils.HashPassword(input.Password)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not hash password"})
-		return
+	now := time.Now().UTC()
+	newUser := models.User{
+		ID:        primitive.NewObjectID(),
+		Name:      input.Name,
+		Email:     input.Email,
+		Password:  hash,
+		Role:      input.Role,
+		CreatedAt: now,
 	}
 
-	role := models.Role(input.Role)
-
-	user := models.User{
-		ID:           primitive.NewObjectID(),
-		Name:         input.Name,
-		Email:        input.Email,
-		PasswordHash: hashed,
-		Role:         role,
-		CreatedAt:    time.Now(),
-	}
-
-	_, err = users.InsertOne(ctx, user)
+	_, err = usersCol.InsertOne(ctx, newUser)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create user"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
 
@@ -106,24 +110,33 @@ func Login(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	users := config.DB.Collection("users")
+
+	// use same DB reference style as Register
+	usersCol := config.DB.Collection("users")
 
 	var user models.User
-	err := users.FindOne(ctx, bson.M{"email": input.Email}).Decode(&user)
+	err := usersCol.FindOne(ctx, bson.M{"email": input.Email}).Decode(&user)
 	if err != nil {
+		// helpful debug log for local testing
+		log.Printf("Login: user not found email=%s err=%v\n", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
 
-	// Verify password
-	if err := utils.CheckPassword(user.PasswordHash, input.Password); err != nil {
+	// debug: show hashed password length (do NOT print actual hash in production)
+	log.Printf("Login: found user email=%s hashedLen=%d\n", user.Email, len(user.Password))
+
+	// verify password (hash, plain)
+	if err := utils.CheckPassword(user.Password, input.Password); err != nil {
+		log.Printf("Login: password mismatch for email=%s err=%v\n", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
 
-	// Generate JWT (use user.ID.Hex() as sub)
-	token, err := utils.GenerateJWT(user.ID.Hex(), string(user.Role))
+	// generate JWT, user.ID.Hex() is correct for Mongo ObjectID
+	token, err := utils.GenerateJWT(user.ID.Hex(), user.Role)
 	if err != nil {
+		log.Printf("Login: jwt generation failed err=%v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate token"})
 		return
 	}
@@ -138,6 +151,7 @@ func Login(c *gin.Context) {
 		},
 	})
 }
+
 
 // utility: generate numeric OTP of n digits
 func generateNumericOTP(n int) string {
